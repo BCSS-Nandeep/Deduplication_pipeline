@@ -1,4 +1,6 @@
 .venv/
+.face-venv/
+.fr-venv/
 __pycache__/
 .pytest_cache/
 output/
