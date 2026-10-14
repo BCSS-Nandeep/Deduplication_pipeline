@@ -1,0 +1,21 @@
+# The in-process face comparer (dedup_pipeline.face_recognition.local_comparer, `--face-engine local`, the default engine).
+# Install into the DEDICATED environment `.face-venv`, never into `.venv` (the original pipeline environment) or `.fr-venv`
+# (FR-DOPAMS). These packages are large (about 1 GB). The versions below are the ones the comparer was validated with (CPU):
+# the 525 stored real-service cases replayed to identical evidence. They are all part of the engine fingerprint.
+#
+#   python -m venv .face-venv
+#   .face-venv\Scripts\python -m pip install -r requirements.txt -r requirements-face-local.txt
+#
+# A different version of any package below changes the engine fingerprint, so previously stored local results are then not reused
+# (they are recomputed) rather than silently mixed with results made by other numerics.
+
+insightface==2.0
+onnxruntime==1.23.2      # CPU. For an NVIDIA GPU use onnxruntime-gpu==1.23.2 instead (and re-run the equivalence replay: GPU numerics differ slightly)
+numpy==2.2.6
+opencv-python==4.13.0.92
+scikit-image==0.26.0     # InsightFace's face alignment (similarity transform) comes from scikit-image / scipy
+scipy==1.18.1
+Pillow==12.2.0           # reads image headers for the pixel budget
+
+# The model files come from InsightFace's "buffalo_l" package (det_10g.onnx and w600k_r50.onnx are used) and are expected in
+# ~/.insightface/models/buffalo_l (or the model_root of LocalFaceConfig). Their SHA-256 values are part of the fingerprint.
