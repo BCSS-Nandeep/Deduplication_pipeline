@@ -18,12 +18,17 @@ def _is_name_char(ch: str) -> bool:
     return ch.isalnum() or ch.isspace() or unicodedata.category(ch).startswith("M")
 
 
+def name_tokens(raw: Optional[str]) -> list[str]:
+    """Punctuation becomes a space and whitespace collapses. Original case is kept."""
+    if not raw:
+        return []
+    cleaned = "".join(ch if _is_name_char(ch) else " " for ch in raw)
+    return cleaned.split()
+
+
 def normalize_name(raw: Optional[str]) -> str:
     """Lower-case; anything that is not a letter, digit, combining mark or whitespace becomes a space; whitespace collapsed."""
-    if not raw:
-        return ""
-    cleaned = "".join(ch if _is_name_char(ch) else " " for ch in raw)
-    return " ".join(cleaned.lower().split())
+    return " ".join(token.lower() for token in name_tokens(raw))
 
 
 def token_count(key: str) -> int:

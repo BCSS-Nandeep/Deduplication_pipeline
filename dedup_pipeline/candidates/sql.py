@@ -9,9 +9,12 @@ used as grouping keys in memory; they are not written to the output unless ``exp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
-from .config import ALIAS_NAME, NAME_EXACT, PHONE_EXACT, TOKEN_SORTED, CandidateConfig
+from ..identity.names import COUNTRY_TOKENS, ROLE_TOKENS
+from .config import (
+    ALIAS_NAME, NAME_EXACT, NAME_INITIAL, PHONE_EXACT, RELATIVE_EXACT, RELATIVE_SORTED, TOKEN_SORTED, CandidateConfig,
+)
 
 PERSONS_WITH_ENRICHMENT = (
     "FROM public.persons_unified p LEFT JOIN public.person_enrichment e ON e.person_id = p.person_id"
@@ -46,11 +49,53 @@ def _alias_column(config: CandidateConfig) -> str:
     return "p.alias"
 
 
-def _name_keys_cte(config: CandidateConfig) -> str:
+def _clean_params(config: CandidateConfig) -> dict[str, Any]:
+    if not config.metadata_name_cleaning:
+        return {}
+    return {"name_roles": sorted(ROLE_TOKENS), "name_countries": sorted(COUNTRY_TOKENS)}
+
+
+def _strip_case(column: str) -> str:
+    """One metadata-token removal, same order as ``normalize_identity_name``."""
     return (
-        "WITH k AS (SELECT p.person_id, p.source_system, p.source_record_id, "
-        f"{_NORMALIZE.format(col=_name_column(config))} AS key {PERSONS_WITH_ENRICHMENT})"
+        f"CASE WHEN cardinality({column}) > 1 AND {column}[1] = 'late' THEN {column}[2:cardinality({column})] "
+        f"WHEN cardinality({column}) >= 2 AND {column}[cardinality({column})] = ANY(%(name_roles)s) "
+        f"THEN {column}[1:cardinality({column})-1] "
+        f"WHEN cardinality({column}) >= 3 AND {column}[cardinality({column})] = ANY(%(name_countries)s) "
+        f"THEN {column}[1:cardinality({column})-1] ELSE {column} END"
     )
+
+
+def _relative_column(config: CandidateConfig) -> str:
+    if config.name_source == "cleaned_then_raw":
+        return "COALESCE(NULLIF(btrim(e.cleaned_relative_name), ''), p.relative_name)"
+    return "p.relative_name"
+
+
+def _name_keys_cte(config: CandidateConfig, column_sql: Optional[str] = None) -> str:
+    column = _name_column(config) if column_sql is None else column_sql
+    normalized = _NORMALIZE.format(col=column)
+    if not config.metadata_name_cleaning:
+        return (
+            "WITH k AS (SELECT p.person_id, p.source_system, p.source_record_id, "
+            f"{normalized} AS key {PERSONS_WITH_ENRICHMENT})"
+        )
+    # One CTE per removal. MATERIALIZED stops PostgreSQL from inlining each step into the next:
+    # each step mentions the token array many times, and six inlined steps explode the planner.
+    parts = [
+        "WITH raw AS MATERIALIZED (SELECT p.person_id, p.source_system, p.source_record_id, "
+        f"regexp_split_to_array({normalized}, ' ') AS t {PERSONS_WITH_ENRICHMENT})",
+    ]
+    previous = "raw"
+    for index in range(1, 7):
+        parts.append(
+            f", c{index} AS MATERIALIZED (SELECT person_id, source_system, source_record_id, {_strip_case('t')} AS t FROM {previous})"
+        )
+        previous = f"c{index}"
+    parts.append(
+        f", k AS MATERIALIZED (SELECT person_id, source_system, source_record_id, btrim(array_to_string(t, ' ')) AS key FROM {previous})"
+    )
+    return "".join(parts)
 
 
 # ------------------------------------------------------------------ safety / bookkeeping
@@ -83,7 +128,7 @@ def name_exact_blocks(config: CandidateConfig) -> QuerySpec:
         f"SELECT key, {_AGGREGATES} FROM k "
         f"WHERE key <> '' AND char_length(key) >= %(min_chars)s AND {_TOKENS.format(key='key')} >= %(min_tokens)s "
         "GROUP BY key HAVING count(*) > 1 ORDER BY key",
-        {"min_chars": config.name_min_chars, "min_tokens": config.name_min_tokens},
+        {"min_chars": config.name_min_chars, "min_tokens": config.name_min_tokens, **_clean_params(config)},
     )
 
 
@@ -95,7 +140,7 @@ def token_sorted_blocks(config: CandidateConfig) -> QuerySpec:
         f"s AS (SELECT person_id, source_system, source_record_id, {sorted_key} AS sorted_key FROM k "
         f"WHERE key <> '' AND char_length(key) >= %(min_chars)s AND {_TOKENS.format(key='key')} >= %(min_tokens)s) "
         f"SELECT sorted_key, {_AGGREGATES} FROM s GROUP BY sorted_key HAVING count(*) > 1 ORDER BY sorted_key",
-        {"min_chars": config.name_min_chars, "min_tokens": config.token_sorted_min_tokens},
+        {"min_chars": config.name_min_chars, "min_tokens": config.token_sorted_min_tokens, **_clean_params(config)},
     )
 
 
@@ -159,7 +204,7 @@ def alias_blocks(config: CandidateConfig) -> QuerySpec:
 # ------------------------------------------------------- what the rules exclude (aggregates only)
 
 def name_exclusions(config: CandidateConfig, min_tokens: int, tag: str) -> list[QuerySpec]:
-    params = {"min_chars": config.name_min_chars, "min_tokens": min_tokens}
+    params = {"min_chars": config.name_min_chars, "min_tokens": min_tokens, **_clean_params(config)}
     cte = _name_keys_cte(config)
     toks = _TOKENS.format(key="key")
     return [
@@ -205,9 +250,110 @@ def alias_exclusions(config: CandidateConfig) -> list[QuerySpec]:
     ]
 
 
+def relative_exact_blocks(config: CandidateConfig) -> QuerySpec:
+    return QuerySpec(
+        "relative_exact:blocks",
+        f"/* candidates:relative_exact:blocks */ {_name_keys_cte(config, _relative_column(config))} "
+        f"SELECT key, {_AGGREGATES} FROM k "
+        f"WHERE key <> '' AND char_length(key) >= %(min_chars)s AND {_TOKENS.format(key='key')} >= %(min_tokens)s "
+        "GROUP BY key HAVING count(*) > 1 ORDER BY key",
+        {"min_chars": config.name_min_chars, "min_tokens": config.relative_min_tokens, **_clean_params(config)},
+    )
+
+
+def relative_token_sorted_blocks(config: CandidateConfig) -> QuerySpec:
+    sorted_key = f"array_to_string(ARRAY(SELECT t FROM unnest(regexp_split_to_array(key, ' ')) AS t ORDER BY t COLLATE \"C\"), ' ')"
+    return QuerySpec(
+        "relative_token_sorted:blocks",
+        f"/* candidates:relative_token_sorted:blocks */ {_name_keys_cte(config, _relative_column(config))}, "
+        f"s AS (SELECT person_id, source_system, source_record_id, {sorted_key} AS sorted_key FROM k "
+        f"WHERE key <> '' AND char_length(key) >= %(min_chars)s AND {_TOKENS.format(key='key')} >= %(min_tokens)s) "
+        f"SELECT sorted_key, {_AGGREGATES} FROM s GROUP BY sorted_key HAVING count(*) > 1 ORDER BY sorted_key",
+        {"min_chars": config.name_min_chars, "min_tokens": config.relative_min_tokens, **_clean_params(config)},
+    )
+
+
+def _relative_exclusions(config: CandidateConfig, min_tokens: int, tag: str) -> list[QuerySpec]:
+    saved = config
+    # name_exclusions reads the name CTE. Build the same two statements against the relative column.
+    params = {"min_chars": saved.name_min_chars, "min_tokens": min_tokens, **_clean_params(saved)}
+    cte = _name_keys_cte(saved, _relative_column(saved))
+    toks = _TOKENS.format(key="key")
+    return [
+        QuerySpec(
+            f"{tag}:exclusions",
+            f"/* candidates:{tag}:exclusions */ {cte} SELECT count(*), count(*) FILTER (WHERE key = ''), "
+            f"count(*) FILTER (WHERE key <> '' AND {toks} < %(min_tokens)s), "
+            f"count(*) FILTER (WHERE key <> '' AND {toks} >= %(min_tokens)s AND char_length(key) < %(min_chars)s) FROM k",
+            params,
+        ),
+        QuerySpec(
+            f"{tag}:excluded_blocks",
+            f"/* candidates:{tag}:excluded_blocks */ {cte} SELECT count(*), COALESCE(sum(n), 0), COALESCE(sum(n * (n - 1) / 2), 0) "
+            "FROM (SELECT count(*) AS n FROM k "
+            f"WHERE key <> '' AND ({toks} < %(min_tokens)s OR char_length(key) < %(min_chars)s) GROUP BY key HAVING count(*) > 1) s",
+            params,
+        ),
+    ]
+
+
+def name_initial_blocks(config: CandidateConfig) -> QuerySpec:
+    """Index literal initials and one-token reductions of fully spelled names under the same key."""
+    cte = _name_keys_cte(config)
+    return QuerySpec(
+        "name_initial:blocks",
+        f"/* candidates:name_initial:blocks */ {cte}, "
+        "toks AS (SELECT k.person_id, k.source_system, k.source_record_id, t.token, t.ord::int "
+        "FROM k CROSS JOIN LATERAL regexp_split_to_table(k.key, ' ') WITH ORDINALITY AS t(token, ord) "
+        "WHERE k.key <> ''), "
+        "literal AS (SELECT person_id, source_system, source_record_id, "
+        "(SELECT array_to_string(ARRAY(SELECT t2.token FROM toks t2 WHERE t2.person_id = toks.person_id "
+        "AND char_length(t2.token) >= 2 ORDER BY t2.token COLLATE \"C\"), ' ') || '|' || "
+        "(SELECT string_agg(t3.token, '' ORDER BY t3.token COLLATE \"C\") FROM toks t3 "
+        "WHERE t3.person_id = toks.person_id AND char_length(t3.token) = 1)) AS key, true AS holds_initial "
+        "FROM toks GROUP BY person_id, source_system, source_record_id "
+        "HAVING bool_or(char_length(token) = 1) AND bool_or(char_length(token) >= %(anchor)s) "
+        "AND count(*) FILTER (WHERE char_length(token) >= 2) >= 1), "
+        "reduced AS (SELECT t.person_id, t.source_system, t.source_record_id, "
+        "(SELECT array_to_string(ARRAY(SELECT t2.token FROM toks t2 WHERE t2.person_id = t.person_id AND t2.ord <> t.ord "
+        "AND char_length(t2.token) >= 2 ORDER BY t2.token COLLATE \"C\"), ' ') || '|' || left(t.token, 1)) AS key, "
+        "false AS holds_initial FROM toks t WHERE char_length(t.token) >= %(anchor)s "
+        "AND NOT EXISTS (SELECT 1 FROM toks i WHERE i.person_id = t.person_id AND char_length(i.token) = 1) "
+        "AND EXISTS (SELECT 1 FROM toks o WHERE o.person_id = t.person_id AND o.ord <> t.ord AND char_length(o.token) >= 2)), "
+        "u AS (SELECT key, person_id, source_system, source_record_id, bool_or(holds_initial) AS holds_initial "
+        "FROM (SELECT * FROM literal UNION ALL SELECT * FROM reduced) s GROUP BY key, person_id, source_system, source_record_id) "
+        f"SELECT key, {_AGGREGATES}, array_agg(holds_initial ORDER BY person_id) FROM u "
+        "WHERE key <> '' AND strpos(key, '|') <> 1 GROUP BY key HAVING count(*) > 1 ORDER BY key",
+        {"anchor": config.name_initial_min_anchor_chars, **_clean_params(config)},
+    )
+
+
+def name_initial_exclusions(config: CandidateConfig) -> list[QuerySpec]:
+    cte = _name_keys_cte(config)
+    toks = _TOKENS.format(key="key")
+    params = {"anchor": config.name_initial_min_anchor_chars, "min_tokens": 2, **_clean_params(config)}
+    return [
+        QuerySpec(
+            "name_initial:exclusions",
+            f"/* candidates:name_initial:exclusions */ {cte} SELECT count(*), "
+            "count(*) FILTER (WHERE key = ''), "
+            f"count(*) FILTER (WHERE key <> '' AND {toks} < %(min_tokens)s), "
+            "count(*) FILTER (WHERE key <> '' AND NOT EXISTS ("
+            "SELECT 1 FROM regexp_split_to_table(key, ' ') tok WHERE char_length(tok) >= %(anchor)s)) FROM k",
+            params,
+        ),
+        QuerySpec(
+            "name_initial:excluded_blocks",
+            "/* candidates:name_initial:excluded_blocks */ SELECT 0, 0, 0",
+            {},
+        ),
+    ]
+
+
 def block_query(strategy: str, config: CandidateConfig) -> QuerySpec:
     return {NAME_EXACT: name_exact_blocks, TOKEN_SORTED: token_sorted_blocks, PHONE_EXACT: phone_blocks,
-            ALIAS_NAME: alias_blocks}[strategy](config)
+            ALIAS_NAME: alias_blocks, NAME_INITIAL: name_initial_blocks, RELATIVE_EXACT: relative_exact_blocks,
+            RELATIVE_SORTED: relative_token_sorted_blocks}[strategy](config)
 
 
 def exclusion_queries(strategy: str, config: CandidateConfig) -> list[QuerySpec]:
@@ -215,6 +361,12 @@ def exclusion_queries(strategy: str, config: CandidateConfig) -> list[QuerySpec]
         return name_exclusions(config, config.name_min_tokens, "name_exact")
     if strategy == TOKEN_SORTED:
         return name_exclusions(config, config.token_sorted_min_tokens, "token_sorted_name")
+    if strategy == RELATIVE_EXACT:
+        return _relative_exclusions(config, config.relative_min_tokens, "relative_exact")
+    if strategy == RELATIVE_SORTED:
+        return _relative_exclusions(config, config.relative_min_tokens, "relative_token_sorted")
+    if strategy == NAME_INITIAL:
+        return name_initial_exclusions(config)
     if strategy == PHONE_EXACT:
         return phone_exclusions(config)
     return alias_exclusions(config)

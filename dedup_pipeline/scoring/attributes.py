@@ -6,17 +6,21 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Optional, Sequence
 
+import re
+
 from ..candidates.config import CandidateConfig
 from ..candidates.normalize import normalize_name, phone_key
 from ..db import ReadOnlyConnection
-from .config import ScoringConfig
+from ..identity.names import normalize_identity_name
+from .config import RULE_VERSION_FINAL, ScoringConfig
 
 ATTRIBUTE_QUERY = (
     "/* scoring:attributes */ SELECT p.person_id, p.source_system, p.source_record_id, "
     "COALESCE(NULLIF(btrim(e.cleaned_full_name), ''), p.full_name), "
     "COALESCE(NULLIF(btrim(e.cleaned_alias), ''), p.alias), "
     "COALESCE(NULLIF(btrim(e.cleaned_relative_name), ''), p.relative_name), "
-    "p.phone_number, p.age, p.date_of_birth, p.gender, e.address_resolution "
+    "p.phone_number, p.age, p.date_of_birth, p.gender, e.address_resolution, "
+    "p.present_address_text, p.permanent_address_text "
     "FROM public.persons_unified p LEFT JOIN public.person_enrichment e ON e.person_id = p.person_id "
     "WHERE p.person_id = ANY(%(ids)s) ORDER BY p.person_id"
 )
@@ -29,6 +33,15 @@ FIR_LINK_QUERY = (
 )
 CHUNK = 2000
 DEFINITE_GENDERS = {"male": "Male", "female": "Female"}  # 'Others' / 'Unknown' / 'Transgender' are not compared
+_PIN = re.compile(r"(?<!\d)([1-9][0-9]{5})(?!\d)")
+
+
+def _one_pin(text: Optional[str]) -> str:
+    """A single 6-digit PIN in free text. Several matches are not guessed between."""
+    if not text:
+        return ""
+    found = _PIN.findall(str(text))
+    return found[0] if len(found) == 1 else ""
 
 
 @dataclass(frozen=True)
@@ -36,9 +49,17 @@ class Address:
     state: str = ""
     district: str = ""
     mandal: str = ""
+    village: str = ""
+    pin: str = ""
+    country: str = ""
+    kind: str = ""  # present | permanent | ""
 
     def usable(self) -> bool:
+        """Historical score-v1/v2/v3 gate: state or district."""
         return bool(self.state or self.district)
+
+    def geographic(self) -> bool:
+        return bool(self.state or self.district or self.village or self.mandal or self.pin or self.country)
 
 
 @dataclass(frozen=True)
@@ -57,20 +78,36 @@ class PersonAttributes:
     gender: Optional[str] = None  # "Male" / "Female" only
     addresses: tuple[Address, ...] = field(default_factory=tuple)
     age_info: Optional[Any] = None  # score-v2: age.AgeInfo evaluated at the run's reference date
+    name_normalization: Optional[Any] = None  # score-final NormalizedName
+    relative_normalization: Optional[Any] = None
+    present_address_text: str = ""
+    permanent_address_text: str = ""
 
 
 def _clean(value: Any) -> str:
     return " ".join(str(value).lower().split()) if value is not None else ""
 
 
-def _addresses(raw: Any) -> tuple[Address, ...]:
+def _part_address(part: dict, kind: str, text: Optional[str]) -> Address:
+    village = part.get("village") or part.get("town") or part.get("village_town") or part.get("village_name")
+    pin = part.get("pin") or part.get("pincode") or part.get("pin_code") or part.get("postal_code") or _one_pin(text)
+    return Address(
+        _clean(part.get("state")), _clean(part.get("district")), _clean(part.get("mandal")),
+        _clean(village), _clean(pin), _clean(part.get("country")), kind,
+    )
+
+
+def _addresses(raw: Any, present_text: Optional[str] = None, permanent_text: Optional[str] = None,
+               final: bool = False) -> tuple[Address, ...]:
     out = []
+    texts = {"present": present_text, "permanent": permanent_text}
     if isinstance(raw, dict):
         for kind in ("present", "permanent"):
             part = raw.get(kind)
             if isinstance(part, dict):
-                address = Address(_clean(part.get("state")), _clean(part.get("district")), _clean(part.get("mandal")))
-                if address.usable():
+                address = _part_address(part, kind, texts[kind])
+                # House number, street, locality and path are never copied onto the address, so they cannot affect a score.
+                if (address.geographic() if final else address.usable()):
                     out.append(address)
     return tuple(out)
 
@@ -79,9 +116,19 @@ def build_attributes(row: Sequence[Any], scoring: ScoringConfig, candidate_confi
                      fir_rows: Optional[Sequence[tuple[Any, Any, Any]]] = None) -> PersonAttributes:
     from .age import build_age_info  # imported here: age.py needs fields.py, which needs this module
 
-    pid, source, record, name, alias, relative, phone, age, dob, gender, address = row
+    pid, source, record, name, alias, relative, phone, age, dob, gender, address = row[:11]
+    present_text = row[11] if len(row) > 11 else None
+    permanent_text = row[12] if len(row) > 12 else None
     key, reason = phone_key(phone, candidate_config)  # the same plausibility rules as candidate generation
     meaningful = age is not None and scoring.age_min <= age <= scoring.age_max
+    final = scoring.rule_version == RULE_VERSION_FINAL
+    if final:
+        named = normalize_identity_name(name)
+        related = normalize_identity_name(relative)
+        name_key, relative_key = named.comparison, related.comparison
+    else:
+        named = related = None
+        name_key, relative_key = normalize_name(name), normalize_name(relative)
     if scoring.rule_version == "score-v3":
         from .age_v3 import build_age_evidence
 
@@ -90,12 +137,15 @@ def build_attributes(row: Sequence[Any], scoring: ScoringConfig, candidate_confi
         age_info = build_age_info(dob, age, scoring)
     return PersonAttributes(
         person_id=pid, source_system=source, source_record_id=record,
-        name=normalize_name(name), alias=normalize_name(alias), relative_name=normalize_name(relative),
+        name=name_key, alias=normalize_name(alias), relative_name=relative_key,
         phone=key, phone_reason=reason,
         age=int(age) if meaningful else None,
         age_reason=None if meaningful else ("no_age" if age is None else "age_out_of_range"),
-        dob=dob, gender=DEFINITE_GENDERS.get(_clean(gender)), addresses=_addresses(address),
-        age_info=age_info,
+        dob=dob, gender=DEFINITE_GENDERS.get(_clean(gender)),
+        addresses=_addresses(address, present_text, permanent_text, final),
+        age_info=age_info, name_normalization=named, relative_normalization=related,
+        present_address_text="" if present_text is None else str(present_text),
+        permanent_address_text="" if permanent_text is None else str(permanent_text),
     )
 
 

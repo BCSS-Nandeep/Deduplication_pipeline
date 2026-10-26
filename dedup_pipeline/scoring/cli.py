@@ -71,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--env-file", help="file with UNIFIED_PG_* settings (or use DEDUP_PG_* variables)")
     r.add_argument("--config", type=Path, help="JSON file overriding any ScoringConfig field")
     r.add_argument("--no-face-service", action="store_true", help="do not run face comparison (face comparisons stay pending; run is incomplete)")
-    r.add_argument("--rule-version", choices=["score-v1", "score-v2", "score-v3"],
-                   help="default score-v2; score-v1 reproduces the earlier scoring; score-v3 anchors each age to its FIR date")
+    r.add_argument("--rule-version", choices=["score-v1", "score-v2", "score-v3", "score-final"],
+                   help="default score-v2 (historical). score-final is the authoritative 25/25/20/15/10/5 profile and does not use age, DOB or alias")
     r.add_argument("--reference-date", help="ISO date at which every age is evaluated (score-v2) or the validity cut-off (score-v3). If omitted, today's "
                                               "date is used ONCE, logged and recorded; pass it explicitly for reproducible reruns")
     r.add_argument("--review-order", choices=["score", "conflict_free_first"])

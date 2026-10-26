@@ -15,13 +15,16 @@ from typing import Any, Mapping, Optional
 RULE_VERSION_V1 = "score-v1"  # kept selectable and unchanged: age = integer difference of recorded ages, Phase 2 image order, score ordering
 RULE_VERSION_V2 = "score-v2"  # reference-date age logic, DOB policy, image-outcome memory, conflict-aware review order
 RULE_VERSION_V3 = "score-v3"  # FIR-date-anchored age evidence: birth-year ranges from (recorded age, FIR date), observations with provenance
-RULE_VERSION = RULE_VERSION_V2  # the default for new runs (score-v3 is selected explicitly until its results are validated)
-RULE_VERSIONS = (RULE_VERSION_V1, RULE_VERSION_V2, RULE_VERSION_V3)
+RULE_VERSION_FINAL = "score-final"  # authoritative spec profile: 25/25/20/15/10/5, no age, DOB or alias. Selected explicitly.
+RULE_VERSION = RULE_VERSION_V2  # historical default. score-final is explicit so earlier review scores are not silently reinterpreted.
+RULE_VERSIONS = (RULE_VERSION_V1, RULE_VERSION_V2, RULE_VERSION_V3, RULE_VERSION_FINAL)
 OBSERVATION_CONFLICT_POLICIES = ("unavailable", "hull")
 # Fields that only score-v3 reads. They are left out of the serialised config of v1/v2 runs so those configurations
 # (and their signatures) stay exactly what they were before score-v3 existed.
 V3_ONLY_FIELDS = ("fir_timezone", "fir_date_min_year", "fir_date_placeholder_dates", "birth_year_tolerance_years",
                   "birth_year_conflict_gap_years", "observation_conflict_policy")
+# Present on the object for every version, but omitted from v1/v2/v3 serialisation so those signatures stay unchanged.
+FINAL_ONLY_FIELDS = ("face_pass_threshold", "address_component_weights")
 SCHEMA_VERSION = "review-v2"
 SCHEMA_VERSION_V1 = "review-v1"
 IMAGE_RANKINGS = ("phase2_rank", "outcome_memory")
@@ -39,6 +42,15 @@ FACE_ANCHOR_SAME = 0.58
 DEFAULT_WEIGHTS = {
     "name": 0.25, "alias": 0.05, "relative_name": 0.15, "phone": 0.15,
     "age_dob": 0.10, "gender": 0.05, "address": 0.05, "face": 0.20,
+}
+# Authoritative score-final weights. They sum to 1 (100%). Age, DOB and alias stay in the field list at weight 0
+# so older field names still round-trip, and they never enter the score or the coverage denominator.
+FINAL_WEIGHTS = {
+    "name": 0.25, "face": 0.25, "relative_name": 0.20, "phone": 0.15,
+    "address": 0.10, "gender": 0.05, "alias": 0.0, "age_dob": 0.0,
+}
+ADDRESS_COMPONENT_WEIGHTS = {
+    "village": 0.35, "mandal": 0.20, "district": 0.20, "state": 0.15, "pin": 0.05, "country": 0.05,
 }
 
 
@@ -114,15 +126,25 @@ class ScoringConfig:
     file_proxy_origin: str = ""  # e.g. "https://dopams.example"; empty -> relative /api/file-proxy links
     allow_stale_candidates: bool = False
 
+    # score-final only (stripped from v1/v2/v3 serialisation). Forced to these values for score-final.
+    face_pass_threshold: float = 0.85
+    address_component_weights: Mapping[str, float] = field(default_factory=lambda: dict(ADDRESS_COMPONENT_WEIGHTS))
+
     def __post_init__(self) -> None:
         if self.rule_version not in RULE_VERSIONS:
             raise ValueError(f"rule_version must be one of {RULE_VERSIONS}")
-        v2 = self.rule_version != RULE_VERSION_V1  # score-v2 and score-v3 share the reference-date, image-ranking and review-order machinery
-        object.__setattr__(self, "image_ranking", self.image_ranking or ("outcome_memory" if v2 else "phase2_rank"))
-        object.__setattr__(self, "review_order", self.review_order or ("conflict_free_first" if v2 else "score"))
+        dated = self.rule_version in (RULE_VERSION_V2, RULE_VERSION_V3)
+        final = self.rule_version == RULE_VERSION_FINAL
+        modern = dated or final  # score-v2, score-v3 and score-final share image ranking and review order
+        object.__setattr__(self, "image_ranking", self.image_ranking or ("outcome_memory" if modern else "phase2_rank"))
+        object.__setattr__(self, "review_order", self.review_order or ("conflict_free_first" if modern else "score"))
         if self.image_ranking not in IMAGE_RANKINGS or self.review_order not in REVIEW_ORDERS or self.leap_day_birthday not in LEAP_POLICIES:
             raise ValueError(f"image_ranking in {IMAGE_RANKINGS}, review_order in {REVIEW_ORDERS}, leap_day_birthday in {LEAP_POLICIES}")
-        if v2:
+        if final:
+            object.__setattr__(self, "weights", dict(FINAL_WEIGHTS))
+            object.__setattr__(self, "address_component_weights", dict(ADDRESS_COMPONENT_WEIGHTS))
+            object.__setattr__(self, "face_pass_threshold", 0.85)
+        if dated:
             try:
                 date.fromisoformat(self.reference_date or "")
             except ValueError:
@@ -172,6 +194,10 @@ class ScoringConfig:
         data["dob_day_scores"] = [list(p) for p in self.dob_day_scores]
         data["bands"] = [list(b) for b in self.bands]
         data["fir_date_placeholder_dates"] = list(self.fir_date_placeholder_dates)
+        data["address_component_weights"] = dict(self.address_component_weights)
+        if self.rule_version != RULE_VERSION_FINAL:
+            for key in FINAL_ONLY_FIELDS:
+                data.pop(key, None)
         if self.rule_version != RULE_VERSION_V3:
             for key in V3_ONLY_FIELDS:
                 data.pop(key, None)

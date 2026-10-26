@@ -54,6 +54,9 @@ def _mask(phone: Optional[str]) -> str:
 # ------------------------------------------------------------------------------ names
 
 def score_name(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import score_name_final
+        return score_name_final(a, b, config)
     result = name_similarity(a.name, b.name)
     if result is None:
         return _na("name", config, "name_missing", "A name is missing on at least one record.")
@@ -65,6 +68,9 @@ def score_name(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) 
 
 
 def score_relative_name(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import score_relative_final
+        return score_relative_final(a, b, config)
     result = name_similarity(a.relative_name, b.relative_name)
     if result is None:
         return _na("relative_name", config, "relative_name_missing", "Relative's name missing on at least one record.")
@@ -76,6 +82,9 @@ def score_relative_name(a: PersonAttributes, b: PersonAttributes, config: Scorin
 
 
 def score_alias(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import excluded_signal
+        return excluded_signal("alias", config)
     """Best similarity between either alias and the other person's name or alias.
 
     With an alias on both sides the comparison is informative either way. With an alias on one side only, an alias
@@ -112,6 +121,9 @@ def score_phone(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig)
 # ------------------------------------------------------------------------- age / DOB
 
 def score_age_dob(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import excluded_signal
+        return excluded_signal("age_dob", config)
     if config.rule_version == "score-v3":  # FIR-date-anchored age evidence in age_v3.py
         from .age_v3 import compare_age_dob_v3
 
@@ -172,6 +184,9 @@ _ORDER = ("none", "state", "district", "mandal")
 
 
 def score_address(a: PersonAttributes, b: PersonAttributes, config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import score_address_final
+        return score_address_final(a, b, config)
     """Best agreement over present/permanent address combinations, at state / district / mandal level."""
     combos = [(x, y) for x in a.addresses for y in b.addresses]
     if not combos:

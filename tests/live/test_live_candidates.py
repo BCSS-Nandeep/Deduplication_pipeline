@@ -21,10 +21,13 @@ import pytest
 
 from dedup_pipeline.candidates import CandidateConfig, RunOptions, run_candidate_generation
 from dedup_pipeline.candidates import sql as sqlmod
-from dedup_pipeline.candidates.config import ALIAS_NAME, NAME_EXACT, PHONE_EXACT, TOKEN_SORTED
+from dedup_pipeline.candidates.config import (
+    ALIAS_NAME, NAME_EXACT, NAME_INITIAL, PHONE_EXACT, RELATIVE_EXACT, RELATIVE_SORTED, TOKEN_SORTED,
+)
 from dedup_pipeline.candidates.normalize import (
     name_exclusion_reason, normalize_name, phone_key, pick_name, token_sorted_key,
 )
+from dedup_pipeline.identity.names import initial_index_keys, normalize_identity_name
 from dedup_pipeline.db import connect_read_only, load_connection_settings
 
 pytestmark = [pytest.mark.live, pytest.mark.skipif(os.environ.get("DEDUP_LIVE_DB") != "1", reason="DEDUP_LIVE_DB=1 not set")]
@@ -36,8 +39,18 @@ def conn():
         yield c
 
 
-def reference(persons, cfg: CandidateConfig) -> dict[tuple[str, str], set[str]]:
-    """Independent implementation: group rows in Python with the reference normalisers."""
+def _cmp(raw, cfg: CandidateConfig) -> str:
+    if cfg.metadata_name_cleaning:
+        return normalize_identity_name(raw).comparison
+    return normalize_name(raw)
+
+
+def reference(persons, cfg: CandidateConfig, deferred: list | None = None) -> dict[tuple[str, str], set[str]]:
+    """Independent implementation: group rows in Python with the reference normalisers.
+
+    Blocks larger than the strategy cap are omitted from the returned pairs. When ``deferred`` is a list,
+    each omitted block is appended as ``(strategy, person ids)`` and is not truncated to the cap.
+    """
     found: dict[tuple[str, str], set[str]] = defaultdict(set)
 
     def add(strategy, members):
@@ -45,9 +58,13 @@ def reference(persons, cfg: CandidateConfig) -> dict[tuple[str, str], set[str]]:
             found[(a, b)].add(strategy)
 
     name_groups, sorted_groups, phone_groups = defaultdict(list), defaultdict(list), defaultdict(list)
+    relative_groups, relative_sorted = defaultdict(list), defaultdict(list)
+    initial_groups: dict[str, dict[str, bool]] = defaultdict(dict)
     alias_groups: dict[str, dict[str, bool]] = defaultdict(dict)
     for p in persons:
-        name = normalize_name(pick_name(p["cleaned_full_name"], p["full_name"], cfg))
+        raw_name = pick_name(p["cleaned_full_name"], p["full_name"], cfg)
+        name = _cmp(raw_name, cfg)
+        relative = _cmp(pick_name(p.get("cleaned_relative_name"), p.get("relative_name"), cfg), cfg)
         if name_exclusion_reason(name, cfg.name_min_tokens, cfg.name_min_chars) is None:
             name_groups[name].append(p["person_id"])
         if name_exclusion_reason(name, cfg.token_sorted_min_tokens, cfg.name_min_chars) is None:
@@ -60,17 +77,49 @@ def reference(persons, cfg: CandidateConfig) -> dict[tuple[str, str], set[str]]:
         alias = normalize_name(pick_name(p["cleaned_alias"], p["alias"], cfg))
         if name_exclusion_reason(alias, cfg.alias_min_tokens, cfg.name_min_chars) is None:
             alias_groups[alias][p["person_id"]] = True
-    for groups, strategy, cap in ((name_groups, NAME_EXACT, cfg.name_max_block_size),
-                                  (sorted_groups, TOKEN_SORTED, cfg.token_sorted_max_block_size),
-                                  (phone_groups, PHONE_EXACT, cfg.phone_max_block_size)):
+        if cfg.relative_exact_enabled and name_exclusion_reason(relative, cfg.relative_min_tokens, cfg.name_min_chars) is None:
+            relative_groups[relative].append(p["person_id"])
+        if cfg.relative_token_sorted_enabled and name_exclusion_reason(relative, cfg.relative_min_tokens, cfg.name_min_chars) is None:
+            relative_sorted[token_sorted_key(relative)].append(p["person_id"])
+        if cfg.name_initial_enabled:
+            for key, holds in initial_index_keys(name, cfg.name_initial_min_anchor_chars):
+                current = initial_groups[key].get(p["person_id"])
+                if current is None or holds:
+                    initial_groups[key][p["person_id"]] = holds
+    for groups, strategy, cap, enabled in (
+            (name_groups, NAME_EXACT, cfg.name_max_block_size, cfg.name_exact_enabled),
+            (sorted_groups, TOKEN_SORTED, cfg.token_sorted_max_block_size, cfg.token_sorted_enabled),
+            (phone_groups, PHONE_EXACT, cfg.phone_max_block_size, cfg.phone_enabled),
+            (relative_groups, RELATIVE_EXACT, cfg.relative_max_block_size, cfg.relative_exact_enabled),
+            (relative_sorted, RELATIVE_SORTED, cfg.relative_max_block_size, cfg.relative_token_sorted_enabled)):
+        if not enabled:
+            continue
         for members in groups.values():
+            if len(members) > cap:
+                if deferred is not None:
+                    deferred.append((strategy, tuple(sorted(members))))
+                continue
             if 2 <= len(members) <= cap:
                 add(strategy, members)
     for members in alias_groups.values():
-        if 2 <= len(members) <= cfg.alias_max_block_size and any(members.values()):
+        if len(members) > cfg.alias_max_block_size:
+            if deferred is not None and cfg.alias_enabled:
+                deferred.append((ALIAS_NAME, tuple(sorted(members))))
+            continue
+        if cfg.alias_enabled and 2 <= len(members) <= cfg.alias_max_block_size and any(members.values()):
             for a, b in combinations(sorted(members), 2):
                 if members[a] or members[b]:
                     found[(a, b)].add(ALIAS_NAME)
+    if cfg.name_initial_enabled:
+        for members in initial_groups.values():
+            if len(members) > cfg.name_initial_max_block_size:
+                if deferred is not None:
+                    deferred.append((NAME_INITIAL, tuple(sorted(members))))
+                continue
+            if 2 <= len(members) <= cfg.name_initial_max_block_size and any(members.values()):
+                for a, b in combinations(sorted(members), 2):
+                    if members[a] or members[b]:
+                        found[(a, b)].add(NAME_INITIAL)
     return found
 
 

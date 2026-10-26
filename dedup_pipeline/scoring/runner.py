@@ -383,7 +383,10 @@ def _score_one(c, store, images, config, face_results, selections, tally, index,
     score = outcome.match_score or 0.0
     group = int(record["review_group"][0])
     # score-v2: review group first (no hard conflict, hard conflict, insufficient, technical failure), then score; score-v1: score only
-    index.append((((group if config.review_order != "score" else (1 if outcome.insufficient else 0)), -score, cid), offset, len(line) - 1))
+    group_key = group if config.review_order != "score" else (1 if outcome.insufficient else 0)
+    # score-final breaks score ties toward higher evidence coverage so a thin high score is not treated as equally supported.
+    order = (group_key, -score, -outcome.coverage, cid) if config.rule_version == "score-final" else (group_key, -score, cid)
+    index.append((order, offset, len(line) - 1))
     tally.groups[record["review_group"]] += 1
     age = record["age_dob_summary"]
     if age:

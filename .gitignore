@@ -6,3 +6,5 @@ __pycache__/
 output/
 *.pyc
 .env
+tests/fixtures/candidate_parity_extract.json
+fixtures/local_parity/

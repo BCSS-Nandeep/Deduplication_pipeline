@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from ..db import connect_read_only, load_connection_settings
-from .config import SOURCE_POLICIES, CandidateConfig
+from .config import SOURCE_POLICIES, CandidateConfig, final_candidate_config
 from .runner import RunOptions, run_candidate_generation
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output" / "candidates"
@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phone-max-block", type=int)
     p.add_argument("--name-min-tokens", type=int)
     p.add_argument("--no-alias", action="store_true", help="disable the alias-matches-name strategy")
+    p.add_argument("--profile", choices=["legacy", "final"], default="legacy",
+                   help="final: metadata-cleaned names, relative-name and initial blocks, no alias. legacy is the historical default")
     p.add_argument("--export-keys", action="store_true", help="write normalised names/numbers to the output (sensitive)")
     p.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR, help="completed Phase 2 output to link (default: output/image_resolution)")
     p.add_argument("--fresh", action="store_true", help="ignore any checkpoint")
@@ -37,7 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> CandidateConfig:
-    values = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+    values = final_candidate_config().to_dict() if getattr(args, "profile", "legacy") == "final" else {}
+    if args.config:
+        values.update(json.loads(args.config.read_text(encoding="utf-8")))
     for key, flag in (("source_policy", args.source_policy), ("name_max_block_size", args.name_max_block),
                       ("phone_max_block_size", args.phone_max_block), ("name_min_tokens", args.name_min_tokens)):
         if flag is not None:

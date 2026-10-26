@@ -15,9 +15,13 @@ NAME_SOURCES = ("cleaned_then_raw", "raw")
 
 NAME_EXACT = "name_exact"
 TOKEN_SORTED = "token_sorted_name"
+NAME_INITIAL = "name_initial"
+RELATIVE_EXACT = "relative_exact"
+RELATIVE_SORTED = "relative_token_sorted"
 PHONE_EXACT = "phone_exact"
 ALIAS_NAME = "alias_name"
-ALL_STRATEGIES = (NAME_EXACT, TOKEN_SORTED, PHONE_EXACT, ALIAS_NAME)  # fixed order: output is deterministic
+# Relative order of the original four rules is unchanged, so existing rule-name lists stay stable.
+ALL_STRATEGIES = (NAME_EXACT, TOKEN_SORTED, NAME_INITIAL, RELATIVE_EXACT, RELATIVE_SORTED, PHONE_EXACT, ALIAS_NAME)
 
 
 @dataclass(frozen=True)
@@ -48,8 +52,19 @@ class CandidateConfig:
     phone_blocklist: tuple[str, ...] = ("1234567890", "0123456789", "9876543210")
     phone_max_block_size: int = 20  # a number shared by more people than this is a shared line, not a duplicate
 
-    # --- strategy 4: alias of one person equals the name (or alias) of another
+    # --- strategy 4: alias of one person equals the name (or alias) of another.
+    # Kept for historical runs. The final profile turns it off: alias is not a candidate signal there.
     alias_enabled: bool = True
+
+    # --- final-profile signals. Off unless selected, so existing runs stay reproducible.
+    metadata_name_cleaning: bool = False  # strip leading "late", trailing role/country before blocking
+    name_initial_enabled: bool = False
+    name_initial_max_block_size: int = 15  # smaller than name blocks: a shared surname plus one initial is common
+    name_initial_min_anchor_chars: int = 4  # a block needs one token at least this long; a bare initial is not a block
+    relative_exact_enabled: bool = False
+    relative_token_sorted_enabled: bool = False
+    relative_min_tokens: int = 2
+    relative_max_block_size: int = 30
     alias_min_tokens: int = 2
     alias_max_block_size: int = 30
 
@@ -66,9 +81,12 @@ class CandidateConfig:
             raise ValueError(f"source_policy must be one of {SOURCE_POLICIES}")
         if self.name_source not in NAME_SOURCES:
             raise ValueError(f"name_source must be one of {NAME_SOURCES}")
-        for name in ("name_max_block_size", "token_sorted_max_block_size", "phone_max_block_size", "alias_max_block_size"):
+        for name in ("name_max_block_size", "token_sorted_max_block_size", "phone_max_block_size", "alias_max_block_size",
+                     "name_initial_max_block_size", "relative_max_block_size"):
             if getattr(self, name) < 2:
                 raise ValueError(f"{name} must be at least 2")
+        if self.name_initial_min_anchor_chars < 2:
+            raise ValueError("name_initial_min_anchor_chars must be at least 2")
         for name in ("name_min_tokens", "token_sorted_min_tokens", "alias_min_tokens", "name_min_chars", "phone_min_distinct_digits"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be at least 1")
@@ -81,11 +99,15 @@ class CandidateConfig:
 
     def enabled_strategies(self) -> list[str]:
         flags = {NAME_EXACT: self.name_exact_enabled, TOKEN_SORTED: self.token_sorted_enabled,
+                 NAME_INITIAL: self.name_initial_enabled, RELATIVE_EXACT: self.relative_exact_enabled,
+                 RELATIVE_SORTED: self.relative_token_sorted_enabled,
                  PHONE_EXACT: self.phone_enabled, ALIAS_NAME: self.alias_enabled}
         return [s for s in ALL_STRATEGIES if flags[s]]
 
     def max_block_size(self, strategy: str) -> int:
         return {NAME_EXACT: self.name_max_block_size, TOKEN_SORTED: self.token_sorted_max_block_size,
+                NAME_INITIAL: self.name_initial_max_block_size, RELATIVE_EXACT: self.relative_max_block_size,
+                RELATIVE_SORTED: self.relative_max_block_size,
                 PHONE_EXACT: self.phone_max_block_size, ALIAS_NAME: self.alias_max_block_size}[strategy]
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,3 +132,20 @@ class CandidateConfig:
         for name in ("checkpoint_every_blocks", "stream_batch_size", "deferred_listing_cap", "impact_pair_limit"):
             data.pop(name)
         return data
+
+
+def final_candidate_config(**overrides: Any) -> CandidateConfig:
+    """Candidate settings for the final identity profile.
+
+    Alias, age and date of birth are not signals. Relative name, token order, compatible initials and phone are.
+    Age and date of birth were never blocking keys.
+    """
+    values: dict[str, Any] = {
+        "alias_enabled": False,
+        "metadata_name_cleaning": True,
+        "name_initial_enabled": True,
+        "relative_exact_enabled": True,
+        "relative_token_sorted_enabled": True,
+    }
+    values.update(overrides)
+    return CandidateConfig.from_dict(values)

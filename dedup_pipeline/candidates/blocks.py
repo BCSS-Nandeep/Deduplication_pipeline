@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Iterator, Optional, Sequence
 
-from .config import ALIAS_NAME, NAME_EXACT, PHONE_EXACT, TOKEN_SORTED, CandidateConfig
+from .config import ALIAS_NAME, NAME_INITIAL, PHONE_EXACT
 from .normalize import token_count
 
 
@@ -16,6 +16,7 @@ class Member:
     source_system: str
     source_record_id: str
     is_alias: bool = False  # alias strategy only: the person matched through their alias
+    holds_initial: bool = False  # name_initial strategy: this member's name contains a one-letter token
 
 
 @dataclass
@@ -38,8 +39,11 @@ class Block:
 
 def parse_block_row(strategy: str, ordinal: int, row: Sequence[Any]) -> Block:
     key, ids, sources, records = row[0], row[1], row[2], row[3]
-    aliases = row[4] if strategy == ALIAS_NAME else [False] * len(ids)
-    members = [Member(i, s, r, bool(a)) for i, s, r, a in zip(ids, sources, records, aliases)]
+    flags = row[4] if strategy in (ALIAS_NAME, NAME_INITIAL) else [False] * len(ids)
+    if strategy == NAME_INITIAL:
+        members = [Member(i, s, r, holds_initial=bool(flag)) for i, s, r, flag in zip(ids, sources, records, flags)]
+    else:
+        members = [Member(i, s, r, bool(flag)) for i, s, r, flag in zip(ids, sources, records, flags)]
     members.sort(key=lambda m: m.person_id)  # canonical order does not depend on the server's array order
     return Block(strategy, ordinal, key, members)
 
@@ -59,9 +63,17 @@ def policy_allows(source_a: str, source_b: str, policy: str) -> bool:
     return True
 
 
+def _marked(member: Member, strategy: str) -> bool:
+    if strategy == ALIAS_NAME:
+        return member.is_alias
+    if strategy == NAME_INITIAL:
+        return member.holds_initial
+    return True
+
+
 def pair_eligible(a: Member, b: Member, strategy: str, policy: str) -> bool:
-    if strategy == ALIAS_NAME and not (a.is_alias or b.is_alias):
-        return False  # two plain-name members already agree by name; the alias rule needs an alias on one side
+    if strategy in (ALIAS_NAME, NAME_INITIAL) and not (_marked(a, strategy) or _marked(b, strategy)):
+        return False  # alias needs an alias on one side; initials need a literal initial on one side
     return policy_allows(a.source_system, b.source_system, policy)
 
 
@@ -73,8 +85,8 @@ def count_pairs(block: Block, policy: str) -> tuple[int, int, int]:
     """
     n = block.size
     total = n * (n - 1) // 2
-    if block.strategy == ALIAS_NAME:
-        eligible = [(a, b) for a, b in combinations(block.members, 2) if a.is_alias or b.is_alias]
+    if block.strategy in (ALIAS_NAME, NAME_INITIAL):
+        eligible = [(a, b) for a, b in combinations(block.members, 2) if _marked(a, block.strategy) or _marked(b, block.strategy)]
         return total, len(eligible), sum(1 for a, b in eligible if policy_allows(a.source_system, b.source_system, policy))
     by_source: dict[str, int] = {}
     for m in block.members:

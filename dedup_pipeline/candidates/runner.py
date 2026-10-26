@@ -100,6 +100,13 @@ def _exclusions(conn: ReadOnlyConnection, strategy: str, config: CandidateConfig
     if strategy == "alias_name":
         row = _one(conn, queries[0])
         return {"persons_with_alias": row[0], "alias_below_minimum": row[1]}
+    if strategy == "name_initial":
+        counts, blocks = _one(conn, queries[0]), _one(conn, queries[1])
+        return {
+            "persons": counts[0], "blank_name": counts[1], "too_few_tokens": counts[2], "no_anchor_token": counts[3],
+            "excluded_blocks": {"blocks": blocks[0], "members": int(blocks[1]), "pairs": int(blocks[2]),
+                                "reason": "name has no token long enough to anchor an initial block"},
+        }
     counts, blocks = _one(conn, queries[0]), _one(conn, queries[1])
     return {
         "persons": counts[0], "blank_name": counts[1], "too_few_tokens": counts[2], "too_short": counts[3],
@@ -158,7 +165,8 @@ def process_strategy(
                     "strategy": strategy, "block_ordinal": ordinal, "reason": "block_too_large", "limit": cap,
                     "member_count": block.size, "would_be_pairs": total_pairs, "would_be_pairs_after_policy": allowed_pairs,
                     "source_counts": source_counts(block), "hint": block.hint(),
-                    "members": [[m.person_id, m.source_system, m.is_alias] for m in block.members],
+                    "members": [[m.person_id, m.source_system, m.holds_initial if strategy == "name_initial" else m.is_alias]
+                                for m in block.members],
                 })
             else:
                 stats["blocks_processed"] += 1

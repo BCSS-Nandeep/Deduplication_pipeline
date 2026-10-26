@@ -26,6 +26,9 @@ BAND_TEXT = {"A": "highest score band", "B": "high", "C": "moderate", "D": "low"
 
 
 def face_field(evidence: Optional[PairFaceEvidence], config: ScoringConfig) -> FieldResult:
+    if config.rule_version == "score-final":
+        from .final_rules import face_field_final
+        return face_field_final(evidence, config)
     weight = config.effective_weight("face")
     if evidence is None:
         return FieldResult("face", weight, False, None, "No face comparison: not both records have a usable image.",
@@ -59,6 +62,10 @@ class ScoreOutcome:
 
 
 def combine(fields: dict[str, FieldResult], config: ScoringConfig) -> ScoreOutcome:
+    if config.rule_version == "score-final":
+        for item in fields.values():
+            if item.applicable and item.score is not None and not 0.0 <= item.score <= 1.0:
+                raise ValueError(f"invalid score for {item.field}: {item.score}")
     total = sum(config.effective_weight(n) for n in FIELD_NAMES)
     used = [f for f in fields.values() if f.applicable and f.weight > 0 and f.score is not None]
     applicable_weight = sum(f.weight for f in used)
@@ -129,6 +136,11 @@ def face_block(evidence: Optional[PairFaceEvidence], outcome: ScoreOutcome, conf
         block["service_threshold"] = evidence.decision_threshold
         block["relative_to_service_threshold"] = "above" if evidence.status is PairStatus.MATCHED else "below"
         block["service_threshold_note"] = "FR-DOPAMS 1:1 verification threshold (calibrated on 5 people). Not an identity decision."
+    if face.detail.get("threshold_outcome"):
+        block["threshold_outcome"] = face.detail["threshold_outcome"]
+        block["mapped_score"] = face.detail.get("mapped_score")
+        block["pass_threshold"] = face.detail.get("pass_threshold")
+        block["threshold_note"] = "Face criterion passes only when the mapped 0-1 score is strictly greater than 0.85. Not an identity decision."
     return block
 
 
@@ -235,7 +247,9 @@ def build_record(
 ) -> dict[str, Any]:
     include = config.include_values
     matching = [{"field": n, "score": round(f.score, 4), "explanation": f.explanation}
-                for n, f in outcome.fields.items() if f.applicable and f.score is not None and f.score >= config.match_threshold]
+                for n, f in outcome.fields.items()
+                if f.applicable and f.score is not None and f.score >= config.match_threshold
+                and not (n == "address" and f.detail.get("address_evidence_complete") is False)]
     conflicts = [{"field": n, "severity": f.conflict, "explanation": f.explanation}
                  for n, f in outcome.fields.items() if f.conflict]
     quality = outcome.fields["age_dob"].detail.get("data_quality", [])  # a record whose own age and DOB disagree
@@ -247,7 +261,8 @@ def build_record(
     review_flags = outcome.fields["age_dob"].detail.get("review_flags", [])  # score-v3: contradicting / adjusted age observations
     conflicts += [{"field": "age_dob", "severity": "data_quality", "explanation": f"Record {f['record'].upper()}: {f['explanation']}"} for f in review_flags]
     missing = [{"field": n, "reason": f.reason_not_applicable, "explanation": f.explanation}
-               for n, f in outcome.fields.items() if not f.applicable]
+               for n, f in outcome.fields.items()
+               if not f.applicable and f.reason_not_applicable != "not_in_score_final"]
     used = {m for m in (evidence.media_id_a, evidence.media_id_b) if m} if evidence else set()
     if evidence:
         used |= {a_[k] for a_ in evidence.attempts for k in ("media_id_a", "media_id_b") if a_.get(k)}
@@ -269,7 +284,7 @@ def build_record(
     band_note = f"{BAND_TEXT[outcome.band]} - ordering aid only, not a decision"
     if hard_conflict:
         band_note += "; has a hard conflict - read the conflicting attributes first (a weighted average can hide one strong contradiction)"
-    return {
+    record = {
         "schema_version": SCHEMA_VERSION, "rule_version": config.rule_version,
         "candidate_id": candidate["candidate_id"],
         "person_a_id": candidate["person_a_id"], "person_b_id": candidate["person_b_id"],
@@ -297,3 +312,24 @@ def build_record(
         "processing": {"indicators": indicators, "complete": not (evidence is not None and needs_retry(evidence))},
         "review": {"status": "pending", "decision": None, "reviewer_id": None, "reviewed_at": None, "notes": None},
     }
+    if config.rule_version == "score-final":
+        record["score_final"] = {
+            "normalized_match_score": pct(outcome.match_score),
+            "evidence_coverage_percent": pct(outcome.coverage),
+            "weights_percent": {name: round(value * 100, 1) for name, value in config.weights.items() if value},
+            "face_pass_rule": "mapped score strictly greater than 0.85",
+            "name_normalization_a": None if a.name_normalization is None else a.name_normalization.to_dict(),
+            "name_normalization_b": None if b.name_normalization is None else b.name_normalization.to_dict(),
+            "relative_normalization_a": None if a.relative_normalization is None else a.relative_normalization.to_dict(),
+            "relative_normalization_b": None if b.relative_normalization is None else b.relative_normalization.to_dict(),
+            "not_a_probability": True,
+            "automatic_merge": False,
+            "address_evidence": {
+                "applicable": outcome.fields["address"].applicable,
+                "complete": outcome.fields["address"].detail.get("address_evidence_complete"),
+                "components_compared": outcome.fields["address"].detail.get("components_compared"),
+                "components_unavailable": outcome.fields["address"].detail.get("components_unavailable"),
+                "component_coverage": outcome.fields["address"].detail.get("available_component_weight"),
+            },
+        }
+    return record
