@@ -1,7 +1,8 @@
 """Explicit settings of the in-process face comparer, and the fingerprint that goes into the face-cache signature.
 
-Every value that can change a face result is a field here (nothing is read from a hidden environment variable or from the FR-DOPAMS
-repository at run time). The defaults equal the values the FR-DOPAMS ``POST /compare`` endpoint used when the 525 stored results were
+Every value that can change a face result is a field here. ``LocalFaceConfig()`` itself does not read the environment.
+The scoring command reads ``GPU`` from the process environment or ``.env`` and applies it with ``apply_gpu_choice`` before the engine starts.
+The defaults equal the values the FR-DOPAMS ``POST /compare`` endpoint used when the 525 stored results were
 made (``src/config.py``: FACE_MIN_CONF 0.50, FACE_DET_SIZE 640x640, MIN_FACE_SIZE 40, MIN_FACE_SHARPNESS 15, MULTI_FACE_AREA_RATIO 0.5,
 MAX_UPLOAD_MB 10, COMPARE_MAX_PIXELS 40,000,000, PERSON_MATCH_THRESHOLD 0.45, model ``buffalo_l``).
 
@@ -11,9 +12,9 @@ This module imports only the standard library, so the pipeline environment can i
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from .engine_fingerprint import engine_digest
 
@@ -80,6 +81,55 @@ class LocalFaceConfig:
     @classmethod
     def from_file(cls, path: Path) -> "LocalFaceConfig":
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+_GPU_TRUE = {"1", "true", "yes", "on"}
+_GPU_FALSE = {"0", "false", "no", "off"}
+
+
+def parse_gpu_flag(value: Optional[str]) -> Optional[bool]:
+    """``None`` when GPU is unset. ``True`` and ``False`` are the only other results."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in _GPU_TRUE:
+        return True
+    if text in _GPU_FALSE:
+        return False
+    raise ValueError(f"GPU must be true or false, got {value!r}")
+
+
+def _env_file_value(path: Path, name: str) -> Optional[str]:
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, _, raw = text.partition("=")
+        if key.strip() == name:
+            return raw.strip().strip("'\"")
+    return None
+
+
+def gpu_flag_from_sources(environ: Mapping[str, str], env_files: Sequence[Path]) -> Optional[bool]:
+    """Process environment wins, then the first env file that contains ``GPU``."""
+    if "GPU" in environ:
+        return parse_gpu_flag(environ["GPU"])
+    for path in env_files:
+        value = _env_file_value(path, "GPU")
+        if value is not None:
+            return parse_gpu_flag(value)
+    return None
+
+
+def apply_gpu_choice(config: LocalFaceConfig, enabled: Optional[bool]) -> LocalFaceConfig:
+    """``True`` runs buffalo_l on CUDA. ``False`` forces CPU. ``None`` leaves the config unchanged."""
+    if enabled is True:
+        return replace(config, provider="cuda", accept_unvalidated_provider=True)
+    if enabled is False:
+        return replace(config, provider="cpu", accept_unvalidated_provider=False)
+    return config
 
 
 def fingerprint(config: LocalFaceConfig, model_hashes: Mapping[str, str], libraries: Mapping[str, str], provider_used: str) -> str:

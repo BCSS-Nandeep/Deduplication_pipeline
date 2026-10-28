@@ -319,6 +319,36 @@ def test_inputs_must_be_complete_consistent_and_current(world, tmp_path):
     expect("database changed since candidate generation", db=world.db(stamp=(999, "x", 999, "x")))
 
 
+def test_scoring_rejects_image_manifests_without_media_classification(world, tmp_path):
+    """Pre-Phase-1 or classification-disabled image runs must not be scored."""
+    from dedup_pipeline.image_resolution.manifest import MANIFEST_FILE
+
+    image_summary = world.image_dir / "run_summary.json"
+    good = image_summary.read_text()
+    data = json.loads(good)
+    data.pop("media_classification", None)
+    image_summary.write_text(json.dumps(data))
+    with pytest.raises(InputError, match="media classification"):
+        go(world, tmp_path, None, root=tmp_path / "r-stale-class")
+    image_summary.write_text(json.dumps({**json.loads(good), "media_classification": "disabled"}))
+    with pytest.raises(InputError, match="media classification"):
+        go(world, tmp_path, None, root=tmp_path / "r-disabled-class")
+    image_summary.write_text(good)
+    manifest_path = world.image_dir / MANIFEST_FILE
+    lines = manifest_path.read_text().splitlines()
+    patched = []
+    for line in lines:
+        record = json.loads(line)
+        if record.get("usable_for_face_recognition"):
+            record["media_class"] = None
+        patched.append(json.dumps(record, separators=(",", ":")))
+    manifest_path.write_text("\n".join(patched) + "\n")
+    with pytest.raises(InputError, match="media_class"):
+        go(world, tmp_path, None, root=tmp_path / "r-stale-usable")
+    image_summary.write_text(good)
+    manifest_path.write_text("\n".join(lines) + "\n")
+
+
 def test_stale_candidates_can_be_accepted_explicitly_and_are_reported(world, tmp_path):
     summary, _ = go(world, tmp_path, FakeComparer(world, lambda a, b: outcome(0.7)), db=world.db(stamp=(999, "x", 999, "x")),
                     config=V1CONFIG(allow_stale_candidates=True))

@@ -14,7 +14,7 @@ from pathlib import Path
 from ..db import connect_read_only, load_connection_settings
 from ..face_recognition.image_source import ManifestImageLoader
 from ..face_recognition.local_comparer import LocalFacePairComparer
-from ..face_recognition.local_config import LocalFaceConfig
+from ..face_recognition.local_config import LocalFaceConfig, apply_gpu_choice, gpu_flag_from_sources
 from ..image_resolution.file_server import DEFAULT_FILE_SERVER_BASE_URL, HttpFetcher
 from ..image_resolution.resolver import ResolverConfig
 from .config import ScoringConfig
@@ -29,16 +29,29 @@ def add_face_engine_arguments(parser: argparse.ArgumentParser) -> None:
     # engine: there is no HTTP/API engine and no fallback of any kind.
     parser.add_argument("--local-face-config", type=Path, help="JSON file overriding any LocalFaceConfig field")
     parser.add_argument("--face-provider", choices=["cpu", "auto", "cuda"],
-                        help="onnxruntime provider. Default cpu, the only validated one; auto/cuda use a GPU when onnxruntime offers one and are "
-                             "refused unless --accept-unvalidated-provider is given")
+                        help="onnxruntime provider. Overrides the GPU setting in .env. cpu is the validated path; "
+                             "auto/cuda are refused unless GPU=true or --accept-unvalidated-provider is given")
     parser.add_argument("--accept-unvalidated-provider", action="store_true",
                         help="allow a provider whose results have not been replayed against the 525 stored cases (GPU); recorded in the run configuration")
+
+
+def gpu_env_files(args: argparse.Namespace) -> list[Path]:
+    files: list[Path] = []
+    env_file = getattr(args, "env_file", None)
+    if env_file:
+        files.append(Path(env_file))
+    files.append(ROOT / ".env")
+    return files
 
 
 def local_comparer_from_args(args: argparse.Namespace) -> LocalFacePairComparer:
     local_config = LocalFaceConfig.from_file(args.local_face_config) if args.local_face_config else LocalFaceConfig()
     if args.face_provider:
         local_config = replace(local_config, provider=args.face_provider)
+        if args.face_provider == "cpu":
+            local_config = replace(local_config, accept_unvalidated_provider=False)
+    else:
+        local_config = apply_gpu_choice(local_config, gpu_flag_from_sources(os.environ, gpu_env_files(args)))
     if args.accept_unvalidated_provider:
         local_config = replace(local_config, accept_unvalidated_provider=True)
     return LocalFacePairComparer(local_config)
@@ -47,8 +60,8 @@ def local_comparer_from_args(args: argparse.Namespace) -> LocalFacePairComparer:
 def preflight_local_engine(args: argparse.Namespace) -> tuple[LocalFacePairComparer | None, int]:
     """Check the local engine BEFORE anything else happens (no output directory, no database connection). On any problem: a clear message and exit
     code 2. There is no other engine to fall back to."""
-    comparer = local_comparer_from_args(args)
     try:
+        comparer = local_comparer_from_args(args)
         comparer.preflight()  # packages, model files, provider: every problem listed at once
         comparer.verify()  # the model really loads (once per process; the run reuses it)
     except Exception as exc:

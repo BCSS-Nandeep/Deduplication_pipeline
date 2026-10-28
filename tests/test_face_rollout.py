@@ -218,6 +218,8 @@ def test_without_flags_a_run_uses_the_local_engine_and_score_v2(monkeypatch, tmp
     FakeLocal.instances.clear()
     seen = capture_run(monkeypatch)
     monkeypatch.setattr(cli, "LocalFacePairComparer", FakeLocal)
+    monkeypatch.delenv("GPU", raising=False)
+    monkeypatch.setattr(cli, "gpu_env_files", lambda args: [])
     assert cli.main(["run", "--output-root", str(tmp_path / "out"), "--reference-date", "2026-10-12"]) == 0
     backend = seen["backend"]
     assert len(FakeLocal.instances) == 1 and backend.signature_fields is not None and backend.engine_info is not None
@@ -246,3 +248,52 @@ def test_the_unvalidated_provider_flag_reaches_the_configuration_and_is_recorded
     config = FakeLocal.instances[0].config
     assert config.provider == "cuda" and config.accept_unvalidated_provider is True
     assert config.to_dict()["accept_unvalidated_provider"] is True  # visible in the run summary's engine settings
+
+
+def test_gpu_true_in_the_env_file_runs_buffalo_on_cuda(monkeypatch, tmp_path):
+    FakeLocal.instances.clear()
+    capture_run(monkeypatch)
+    monkeypatch.setattr(cli, "LocalFacePairComparer", FakeLocal)
+    monkeypatch.delenv("GPU", raising=False)
+    env = tmp_path / "pipeline.env"
+    env.write_text("GPU=true\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "gpu_env_files", lambda args: [env])
+    assert cli.main(["run", "--output-root", str(tmp_path / "out"), "--reference-date", "2026-10-12"]) == 0
+    config = FakeLocal.instances[0].config
+    assert config.model_name == "buffalo_l" and config.provider == "cuda" and config.accept_unvalidated_provider is True
+
+
+def test_gpu_false_keeps_the_face_engine_on_cpu(monkeypatch, tmp_path):
+    FakeLocal.instances.clear()
+    capture_run(monkeypatch)
+    monkeypatch.setattr(cli, "LocalFacePairComparer", FakeLocal)
+    monkeypatch.setenv("GPU", "false")
+    assert cli.main(["run", "--output-root", str(tmp_path / "out"), "--reference-date", "2026-10-12"]) == 0
+    config = FakeLocal.instances[0].config
+    assert config.provider == "cpu" and config.accept_unvalidated_provider is False
+
+
+def test_face_provider_cpu_overrides_gpu_true(monkeypatch, tmp_path):
+    FakeLocal.instances.clear()
+    capture_run(monkeypatch)
+    monkeypatch.setattr(cli, "LocalFacePairComparer", FakeLocal)
+    monkeypatch.setenv("GPU", "true")
+    cli.main(["run", "--face-provider", "cpu", "--output-root", str(tmp_path / "out"), "--reference-date", "2026-10-12"])
+    config = FakeLocal.instances[0].config
+    assert config.provider == "cpu" and config.accept_unvalidated_provider is False
+
+
+def test_a_bad_gpu_value_stops_before_the_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("GPU", "maybe")
+    monkeypatch.setattr(cli, "gpu_env_files", lambda args: [])
+    assert cli.main(["face-preflight"]) == 2
+    assert "GPU must be true or false" in capsys.readouterr().err
+
+
+def test_the_process_environment_wins_over_the_env_file(tmp_path):
+    from dedup_pipeline.face_recognition.local_config import gpu_flag_from_sources
+    env = tmp_path / ".env"
+    env.write_text("GPU=true\n", encoding="utf-8")
+    assert gpu_flag_from_sources({"GPU": "false"}, [env]) is False
+    assert gpu_flag_from_sources({}, [env]) is True
+    assert gpu_flag_from_sources({}, []) is None

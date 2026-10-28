@@ -207,7 +207,9 @@ class _Cursor:
     def execute(self, sql: str, params: Any = None):
         check_statement_is_read_only(sql)
         self.db.statements.append(sql)
-        if sql.startswith("SHOW transaction_read_only") or sql.startswith("SHOW default_transaction_read_only"):
+        if "inet_server_addr()" in sql:
+            self._rows = [("local",)]
+        elif sql.startswith("SHOW transaction_read_only") or sql.startswith("SHOW default_transaction_read_only"):
             self._rows = [(self.db.read_only,)]
         elif "current_database()" in sql:
             self._rows = [(self.db.database, "PostgreSQL 16.14 fake")]

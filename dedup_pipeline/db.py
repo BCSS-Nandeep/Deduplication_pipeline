@@ -26,6 +26,9 @@ import psycopg2
 # The audit found two databases on the server; only v2 carries media_unified.
 APPROVED_DATABASES = frozenset({"dopams_cctns_v2"})
 DEFAULT_DATABASE = "dopams_cctns_v2"
+# Opt-in local test DBs (comma-separated in DEDUP_APPROVED_LOCAL_DATABASES). Live connections
+# may use these names only when the PostgreSQL server address is loopback.
+LOCAL_APPROVED_ENV = "DEDUP_APPROVED_LOCAL_DATABASES"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV_FILE = PROJECT_ROOT.parent / "Dopams_data_base" / ".env"
@@ -33,6 +36,33 @@ DEFAULT_ENV_FILE = PROJECT_ROOT.parent / "Dopams_data_base" / ".env"
 
 class ReadOnlyViolation(RuntimeError):
     """The connection or a statement is not provably read-only."""
+
+
+def _local_approved_names(environ: Optional[dict[str, str]] = None) -> set[str]:
+    environ = os.environ if environ is None else environ
+    raw = (environ.get(LOCAL_APPROVED_ENV) or "").strip()
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def approved_output_databases(environ: Optional[dict[str, str]] = None) -> frozenset[str]:
+    """Databases allowed in local run_summary stamps (production set plus opt-in local names)."""
+    return frozenset(set(APPROVED_DATABASES) | _local_approved_names(environ))
+
+
+def _require_loopback_for_local_names(conn: "ReadOnlyConnection", extras: set[str]) -> None:
+    """Refuse local-only approved names unless the live server is on loopback."""
+    if not extras:
+        return
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(inet_server_addr()::text, 'local')")
+    address = cur.fetchone()[0]
+    cur.close()
+    if address != "local" and not str(address).startswith(("127.0.0.1", "::1")):
+        raise ReadOnlyViolation(
+            f"{LOCAL_APPROVED_ENV}={sorted(extras)} is set but server address {address!r} is not loopback"
+        )
 
 
 @dataclass(frozen=True)
@@ -186,7 +216,11 @@ class ReadOnlyConnection:
         self.close()
 
 
-def assert_read_only(conn: ReadOnlyConnection, approved: Iterable[str] = APPROVED_DATABASES) -> dict[str, str]:
+def assert_read_only(
+    conn: ReadOnlyConnection,
+    approved: Optional[Iterable[str]] = None,
+    environ: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
     """Ask the server whether the session is read-only; refuse to continue if not."""
     cur = conn.cursor()
     cur.execute("SHOW transaction_read_only")
@@ -200,7 +234,11 @@ def assert_read_only(conn: ReadOnlyConnection, approved: Iterable[str] = APPROVE
         raise ReadOnlyViolation(
             f"Session is not read-only (transaction_read_only={in_tx}, default_transaction_read_only={default})."
         )
-    if database not in set(approved):
+    extras = _local_approved_names(environ)
+    allowed = set(APPROVED_DATABASES if approved is None else approved) | extras
+    if extras:
+        _require_loopback_for_local_names(conn, extras)
+    if database not in allowed:
         raise ReadOnlyViolation(f"Connected to unapproved database {database!r}.")
     return {"database": database, "transaction_read_only": in_tx, "server_version": version.split(",")[0][:40]}
 

@@ -77,6 +77,8 @@ class _Cursor:
         self.db.statements.append(sql)
         if sql.startswith(("SHOW transaction_read_only", "SHOW default_transaction_read_only")):
             self._rows = [(self.db.read_only,)]
+        elif "inet_server_addr()" in sql:
+            self._rows = [("local",)]
         elif "current_database()" in sql:
             self._rows = [(self.db.database, "PostgreSQL 16.14 fake")]
         elif "candidates:preflight_person_ids" in sql:
@@ -159,8 +161,12 @@ def build_world(root: Path, people: list[dict[str, Any]], images: Optional[dict[
             category = item[2] if len(item) > 2 else "person/MEDIA"
             path = (shared_paths or {}).get(media_id, f"person/media/{media_id}")
             rows.append(MediaRow(media_id, pid, category, "VERIFIED_ACCESSIBLE", resolved_relative_path=path))
-            results[media_id] = MediaResult(media_id, Status.USABLE, "VERIFIED_ACCESSIBLE", path_ref=path, path_source="resolved_relative_path",
-                                            resolved_suffix=".png", detected_type="png", width=64 + label, height=64, byte_size=100)
+            results[media_id] = MediaResult(
+                media_id, Status.USABLE, "VERIFIED_ACCESSIBLE", path_ref=path, path_source="resolved_relative_path",
+                resolved_suffix=".png", detected_type="png", width=64 + label, height=64, byte_size=100,
+                media_class="CANDIDATE_PORTRAIT", media_class_confidence=0.9,
+                media_class_reason="test fixture portrait",
+            )
             data = image_bytes(label)
             world.files[url_for(path, ".png")] = data
             world.label_of[data] = media_id
@@ -174,6 +180,7 @@ def build_world(root: Path, people: list[dict[str, Any]], images: Optional[dict[
         "generated_at": "2026-10-12T00:00:00+00:00", "database": {"database": "dopams_cctns_v2"},
         "parameters": {"limit_persons": 5 if partial_images else None, "source_system": None, "only_with_media": False},
         "persons": len(summaries), "media_records": len(manifest), "usable_images": sum(1 for r in results.values() if r.usable),
+        "media_classification": "applied",
     })
     return world
 

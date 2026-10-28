@@ -21,7 +21,7 @@ from dedup_pipeline.image_resolution.file_server import HttpFetcher
 from dedup_pipeline.image_resolution.models import MediaRow, Status
 from dedup_pipeline.image_resolution.resolver import ResolverConfig, resolve_media
 
-from .conftest import PDF_BYTES, FakeDb, make_image
+from .conftest import PDF_BYTES, FakeDb, make_image, make_portrait_image
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "dedup_pipeline"
 
@@ -125,6 +125,26 @@ def test_session_must_be_read_only_and_on_the_approved_database():
         assert_read_only(FakeDb([], [], database="dopams_cctns"))
 
 
+def test_local_database_opt_in_requires_loopback(monkeypatch):
+    from dedup_pipeline.db import LOCAL_APPROVED_ENV, approved_output_databases
+
+    monkeypatch.delenv(LOCAL_APPROVED_ENV, raising=False)
+    assert "dopams_dedup_test" not in approved_output_databases()
+    monkeypatch.setenv(LOCAL_APPROVED_ENV, "dopams_dedup_test")
+    assert "dopams_dedup_test" in approved_output_databases()
+    assert assert_read_only(
+        FakeDb([], [], database="dopams_dedup_test", server_address="127.0.0.1/32"),
+        environ={LOCAL_APPROVED_ENV: "dopams_dedup_test"},
+    )["database"] == "dopams_dedup_test"
+    with pytest.raises(ReadOnlyViolation, match="loopback"):
+        assert_read_only(
+            FakeDb([], [], database="dopams_dedup_test", server_address="192.168.103.106/32"),
+            environ={LOCAL_APPROVED_ENV: "dopams_dedup_test"},
+        )
+    with pytest.raises(ReadOnlyViolation, match="unapproved"):
+        assert_read_only(FakeDb([], [], database="dopams_dedup_test"), environ={})
+
+
 # ----------------------------------------------------------------- settings
 
 def test_settings_prefer_dedup_variables_and_pin_the_database(tmp_path):
@@ -206,11 +226,13 @@ def _row(path):
 
 def test_http_extensionless_image_resolves_despite_octet_stream(server):
     base, handler = server
-    data = make_image("JPEG", (90, 90))
+    # Portrait fixture: Phase 1 classification must still leave a usable candidate.
+    data = make_portrait_image("JPEG")
     handler.files["/files/person/media/abc.jpg"] = data
     config = ResolverConfig(base_url=base)
     result = resolve_media(_row("person/media/abc"), config, HttpFetcher(retries=0))
     assert result.usable and result.resolved_suffix == ".jpg" and result.byte_size == len(data)
+    assert result.media_class == "CANDIDATE_PORTRAIT"
     assert handler.hits[:2] == ["/files/person/media/abc", "/files/person/media/abc.jpg"]
 
 

@@ -106,8 +106,9 @@ onnxruntime / numpy / opencv / scikit-image / scipy / Pillow, and the provider a
 identical. Results made by any other engine (for example the earlier HTTP service) are never used, and a changed library, setting or model file means
 recomputation, never a silent mix. The preflight output lists any installed library that differs from the validated set.
 
-**GPU: not validated.** Only CPU has been replayed against the 525 stored real-service cases. A GPU provider (`--face-provider auto|cuda`) is
-refused unless `--accept-unvalidated-provider` is given, and a GPU deployment needs its own replay first:
+**GPU.** Set `GPU=false` in `.env` to run the whole pipeline on CPU, the validated path. Set `GPU=true` to run the same `buffalo_l` model
+through CUDA (`onnxruntime-gpu`); that choice is recorded as an unvalidated provider because only CPU has been replayed against the 525 stored cases.
+`--face-provider` overrides `.env`. A GPU deployment still needs its own replay first:
 `.face-venv\Scripts\python tools\phase10_replay.py --out <dir> --provider cuda` on that hardware (requires `onnxruntime-gpu` and a CUDA setup), with
 exact agreement before enabling it. GPU results have a different fingerprint and are never mixed with CPU results.
 

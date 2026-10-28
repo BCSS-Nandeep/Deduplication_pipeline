@@ -19,6 +19,7 @@ from .file_server import (
     build_candidates,
 )
 from .formats import SUPPORTED_IMAGE_TYPES, sniff_format, validate_image
+from .media_classifier import MediaClass, classify_media_image
 from .models import TRANSIENT_STATUSES, VERIFIED_ACCESSIBLE, MediaResult, MediaRow, Status
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ class ResolverConfig:
     min_dimension: int = 32
     probe_unverified: bool = False  # also try rows whose availability_status is not VERIFIED_ACCESSIBLE
     category_priority: tuple[str, ...] = ("person/MEDIA", "person/IDENTITY_DETAILS")
+    # Phase 1: classify decoded images before face matching. Off only for explicit legacy experiments.
+    media_classification: bool = True
 
     def signature(self, face_check: bool) -> dict[str, Any]:
         """Everything that changes a result; a checkpoint from other settings is discarded."""
@@ -44,6 +47,7 @@ class ResolverConfig:
             "min_dimension": self.min_dimension,
             "probe_unverified": self.probe_unverified,
             "face_check": face_check,
+            "media_classification": self.media_classification,
         }
 
 
@@ -144,6 +148,22 @@ def resolve_media(
     result.width, result.height = check.width, check.height
     if check.status is not Status.USABLE:
         return done(check.status, check.reason)
+
+    if config.media_classification:
+        classification = classify_media_image(full.body, result.width, result.height)
+        result.media_class = classification.label.value
+        result.media_class_confidence = classification.confidence
+        result.media_class_reason = classification.reason
+        if classification.label is MediaClass.IDENTITY_DOCUMENT:
+            return done(
+                Status.IDENTITY_DOCUMENT_EXCLUDED,
+                f"excluded from face matching: {classification.reason}",
+            )
+        if classification.label is not MediaClass.CANDIDATE_PORTRAIT:
+            return done(
+                Status.MEDIA_CLASS_UNCERTAIN,
+                f"not used for face matching until reviewed: {classification.reason}",
+            )
 
     if face_check is not None:
         try:

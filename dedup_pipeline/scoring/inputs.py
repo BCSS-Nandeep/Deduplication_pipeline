@@ -15,7 +15,7 @@ from typing import Any, Iterator, Optional
 
 from ..candidates.runner import GENERATOR_VERSION as CANDIDATE_VERSION
 from ..candidates.store import CANDIDATES_FILE, DEFERRED_FILE, STATE_FILE, SUMMARY_FILE
-from ..db import APPROVED_DATABASES
+from ..db import approved_output_databases
 from ..face_recognition.image_source import ImageIndex
 from ..image_resolution.manifest import MANIFEST_FILE, PERSON_SUMMARY_FILE
 from ..image_resolution.runner import RUN_SUMMARY_FILE as IMAGE_SUMMARY_FILE
@@ -26,6 +26,8 @@ DEFERRED_KEYS = {"strategy", "member_count", "would_be_pairs", "would_be_pairs_a
 MANIFEST_KEYS = {"person_id", "media_id", "resolution_status", "usable_for_face_recognition", "person_rank", "path_ref"}
 SUMMARY_KEYS = {"person_id", "person_status", "usable_image_count"}
 TRANSIENT_RESOLUTION = {"fetch_error", "internal_error", "face_check_error"}
+# Usable face media must have been classified as a portrait by Phase 1 image resolution.
+REQUIRED_USABLE_MEDIA_CLASS = "CANDIDATE_PORTRAIT"
 
 
 class InputError(RuntimeError):
@@ -90,7 +92,7 @@ def validate_candidates(directory: Path) -> CandidateInput:
     version = str(summary.get("generator_version", ""))
     if version != CANDIDATE_VERSION:
         raise InputError(f"unsupported candidate generator version {version!r} (this scorer reads {CANDIDATE_VERSION!r})")
-    if summary.get("database", {}).get("database") not in APPROVED_DATABASES:
+    if summary.get("database", {}).get("database") not in approved_output_databases():
         raise InputError("Phase 5 output was not produced from the approved database")
     candidates_path, deferred_path = directory / CANDIDATES_FILE, directory / DEFERRED_FILE
     for path in (candidates_path, deferred_path):
@@ -127,8 +129,14 @@ def validate_candidates(directory: Path) -> CandidateInput:
 
 def validate_images(directory: Path, expected_persons: Optional[int]) -> ImageInput:
     summary = _read_json(directory / IMAGE_SUMMARY_FILE, "Phase 2 image resolution")
-    if summary.get("database", {}).get("database") not in APPROVED_DATABASES:
+    if summary.get("database", {}).get("database") not in approved_output_databases():
         raise InputError("Phase 2 output was not produced from the approved database")
+    if summary.get("media_classification") != "applied":
+        raise InputError(
+            "Phase 2 image resolution predates media classification or has it disabled "
+            "(run_summary.json media_classification must be 'applied'). Regenerate the image "
+            "resolution outputs before scoring so identity documents are not used for face matching."
+        )
     unresolved_persons: set[str] = set()  # persons with media the image run could not settle (transient errors)
     usable: dict[str, list[dict[str, Any]]] = {}  # kept from this single parse, so the index below does not parse the files again
     person_rows: list[dict[str, Any]] = []
@@ -145,6 +153,12 @@ def validate_images(directory: Path, expected_persons: Optional[int]) -> ImageIn
                 if record["resolution_status"] in TRANSIENT_RESOLUTION:
                     unresolved_persons.add(record["person_id"])
                 if record["usable_for_face_recognition"]:
+                    if record.get("media_class") != REQUIRED_USABLE_MEDIA_CLASS:
+                        raise InputError(
+                            f"{MANIFEST_FILE}: usable media {record.get('media_id')!r} lacks "
+                            f"media_class={REQUIRED_USABLE_MEDIA_CLASS!r} (got {record.get('media_class')!r}). "
+                            "Regenerate image resolution with media classification enabled."
+                        )
                     usable.setdefault(record["person_id"], []).append(record)
             else:
                 person_rows.append(record)

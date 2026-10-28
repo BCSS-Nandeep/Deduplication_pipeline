@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 SHARED_PATHS_FILE = "shared_paths.jsonl"
 RUN_SUMMARY_FILE = "run_summary.json"
 CHECKPOINT_FILE = "checkpoint.jsonl"
+MEDIA_CLASS_REVIEW_FILE = "media_classification_review.jsonl"
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,24 @@ def run_image_resolution(
     write_jsonl_atomic(out / MANIFEST_FILE, manifest)
     write_jsonl_atomic(out / PERSON_SUMMARY_FILE, summaries)
     write_jsonl_atomic(out / SHARED_PATHS_FILE, shared)
+    review = [
+        {
+            "person_id": record["person_id"],
+            "media_id": record["media_id"],
+            "attachment_category": record["attachment_category"],
+            "path_ref": record["path_ref"],
+            "resolution_status": record["resolution_status"],
+            "media_class": record["media_class"],
+            "media_class_confidence": record["media_class_confidence"],
+            "media_class_reason": record["media_class_reason"],
+            "usable_for_face_recognition": record["usable_for_face_recognition"],
+            "selected_for_person": record["selected_for_person"],
+        }
+        for record in manifest
+        if record.get("media_class") in {"IDENTITY_DOCUMENT", "UNKNOWN"}
+        or record["resolution_status"] in {"identity_document_excluded", "media_class_uncertain"}
+    ]
+    write_jsonl_atomic(out / MEDIA_CLASS_REVIEW_FILE, review)
 
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -84,11 +103,15 @@ def run_image_resolution(
         "shared_path_count": len(shared),
         "shared_path_scope": "persons loaded in this run only",
         "face_check": "applied" if face_check is not None else "not_run (no checker supplied)",
+        "media_classification": "applied" if config.media_classification else "disabled",
+        "media_class_review_count": len(review),
+        "media_class": dict(sorted(Counter(m.get("media_class") or "none" for m in manifest).items())),
         "outputs": {
             "manifest": MANIFEST_FILE,
             "person_summary": PERSON_SUMMARY_FILE,
             "shared_paths": SHARED_PATHS_FILE,
             "checkpoint": CHECKPOINT_FILE,
+            "media_classification_review": MEDIA_CLASS_REVIEW_FILE,
         },
     }
     write_json_atomic(out / RUN_SUMMARY_FILE, summary)

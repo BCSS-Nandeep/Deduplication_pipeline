@@ -36,6 +36,9 @@ class Status(str, Enum):
     MULTIPLE_FACES = "multiple_faces"
     LOW_QUALITY = "low_quality"
     FACE_CHECK_ERROR = "face_check_error"
+    # Phase 1 media classification (after decode, before face matching).
+    IDENTITY_DOCUMENT_EXCLUDED = "identity_document_excluded"
+    MEDIA_CLASS_UNCERTAIN = "media_class_uncertain"
     # A bug rather than a data problem.
     INTERNAL_ERROR = "internal_error"
 
@@ -88,6 +91,9 @@ class MediaResult:
     byte_size: Optional[int] = None
     skip_reason: Optional[str] = None
     face_check_status: str = "not_checked"
+    media_class: Optional[str] = None
+    media_class_confidence: Optional[float] = None
+    media_class_reason: Optional[str] = None
 
     @property
     def usable(self) -> bool:

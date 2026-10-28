@@ -12,20 +12,21 @@ from dedup_pipeline.image_resolution.formats import sniff_format
 from dedup_pipeline.image_resolution.models import MediaRow, Status
 from dedup_pipeline.image_resolution.resolver import FaceCheckResult, ResolverConfig, resolve_media
 
-from .conftest import BASE, PDF_BYTES, FakeFetcher, make_image, media_row, url_for
+from .conftest import BASE, PDF_BYTES, FakeFetcher, make_image, make_portrait_image, media_row, url_for
 
 
 # ---------------------------------------------------------- accessible images
 
 @pytest.mark.parametrize("fmt,expected", [("JPEG", "jpeg"), ("PNG", "png"), ("WEBP", "webp")])
 def test_accessible_images_are_usable(config, fmt, expected):
-    data = make_image(fmt, (150, 100))
+    data = make_portrait_image(fmt, (150, 180))
     fetcher = FakeFetcher({url_for("person/media/abc", ".jpg"): data})
     result = resolve_media(media_row(), config, fetcher)
     assert result.status is Status.USABLE and result.usable
     assert result.detected_type == expected
-    assert (result.width, result.height, result.byte_size) == (150, 100, len(data))
+    assert (result.width, result.height, result.byte_size) == (150, 180, len(data))
     assert result.skip_reason is None
+    assert result.media_class == "CANDIDATE_PORTRAIT"
 
 
 def test_type_comes_from_signature_not_from_the_file_name(config, png_bytes):

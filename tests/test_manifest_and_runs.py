@@ -249,7 +249,9 @@ def test_manifest_contains_no_image_data_or_personal_fields(config, jpeg_bytes, 
     assert set(record) == {
         "person_id", "source_system", "media_id", "attachment_category", "availability_status", "path_ref", "path_source",
         "resolved_suffix", "detected_type", "width", "height", "byte_size", "resolution_status",
-        "usable_for_face_recognition", "skip_reason", "face_check_status", "person_rank", "selected_for_person",
+        "usable_for_face_recognition", "skip_reason", "face_check_status",
+        "media_class", "media_class_confidence", "media_class_reason",
+        "person_rank", "selected_for_person",
         "shared_path_flag", "shared_path_person_count",
     }
     assert "http" not in json.dumps(record)  # relative reference only, never the server address
